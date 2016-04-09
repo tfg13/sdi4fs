@@ -1,0 +1,3 @@
+*.o
+linux_main
+mkfs.sdi4fs

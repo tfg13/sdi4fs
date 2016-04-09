@@ -1,0 +1,391 @@
+[view with fixed-size font]
+
+This file contains the only valid data layout specification for the SDI4FS file system.
+This file contains bit-exact descriptions of everything stored on disk.
+
+
+
+#########################################################
+################     GENERAL INFO      ##################
+#########################################################
+
+Everything is stored on disk in little-endian.
+However, numbers depicted herein are normal integers, so if this description says the
+magic for SDI4FS is 0x4D14F5F5 a hex-dump of the disk shows F5F5144D.
+
+All prefixes in this document are power-of-two (IEC 60027-2), so 4KiB = 4096 bytes.
+
+Variable & fields names have a _b(ptr) postfix if they must be interpreted as bytes.
+Without postfix, the correct interpretation is blocks (4KiB).
+
+"iff" means "if, and only if".
+
+SDI4FS consists of three areas on disk (in this order): header, bmap, log
+
+
+
+
+#########################################################
+###################     HEADER      #####################
+#########################################################
+
+The header is always located at the beginning of the file system.
+The header is written during formatting and most fields are never changed afterwards.
+Mounting the filesystem reads the header and parses the information.
+Un-mounting writes some information back into the header.
+
+The header is 4KiB, layout:
+
+0                               32
+----------------------------------
+|           0x4D14F5F5           | (magic number (SDI4FSFS in hex), uint32_t, const)
+----------------------------------
+|            (unused)            | (aligment to 64bits for above, uint32_t, const)
+----------------------------------
+|             size_b             | (total fs size in bytes, uint64_t, const)
+|                                |
+----------------------------------
+|           write_ptr            | (logic write-pointer in log, uint32_t, variable)
+----------------------------------
+|          fast_remount          | (flag for fast (=save) remount, see bmap for explanation, uint32_t, variable)
+----------------------------------
+|          nextBlockID           | (blockID for next new block, uint32_t, variable)
+----------------------------------
+|           usedBlocks           | (number of currently used blocks, uint32_t, variable)
+----------------------------------
+|           umountTime           | (time of last umount, uint32_t, variable)
+----------------------------------
+.                                .
+.            (unused)            . (currently unused)
+.                                .
+----------------------------------
+
+
+
+#########################################################
+####################     BMAP      ######################
+#########################################################
+
+The bmap (block map) is always located directly after the header.
+The bmap is an array of uint32_t logic pointers into the log.
+Neither blockIDs (index of bmap) nor blockPtrs (index in log) can
+ever be zero. Zero is interpreted as unused (bmap) or free (log).
+This means the actual address of a block in bytes-on-disk is
+logStart_bptr[blockPtr - 1].
+Example: To lookup block number 10 in the bmap, look at bmap[9],
+because no block can have blockID 0. The same is true for the log,
+blockPtr 10 points to log[9].
+
+The bmap is used to find the most recent (= only valid) version of
+a block in the log. In order to read block with blockID 10 from disk,
+one needs to lookup bmap[10 - 1] first, which results in a blockPtr.
+Then, the actual block can be read from log[blockPtr - 1].
+If blockPtr is zero, the block is not stored on disk (=valid) {yet, any more}.
+
+The bmap is read into memory during mount and written back to disk during unmount.
+Since the content of the bmap is crucial for fs operations, its
+content must always be valid/correct. If the system crashes after modifications
+to the log, but before a full unmount, the bmap is invalid.
+As a safety measure, the header contains the field "fast_remount".
+This field is set to zero during fs mount and is set to one after a successful unmount.
+If mount detects the filesystem was not correctly unmounted, the bmap on disk is ignored
+and a new bmap is constructed in memory from the contents in the log alone.
+This is *always* possible iff all timestamps previously written to disk were correct and
+the central log write_ptr did never wrap around more than once within one single second.
+(this means sdi4fs can practically always recover from loosing the bmap as long as the UNIX-time
+on the system was increasing monotonously, and the filesystem is not ridiculously small)
+
+The size of the bmap is (total_size_b - header_size_b) / 1024, rounded up to 4KiB blocks.
+So in practice, the bmap occupies about 0.1% of the total fs size.
+The rounding is done for convenience, the bmap only stores pointers for log_size number of blocks. (see next section)
+
+
+#########################################################
+####################     LOG      #######################
+#########################################################
+
+
+The log is a big, linear array of blocks (4KiB each). The log is directly placed after the bmap.
+The log contains only 4KiB blocks. Each block must have a valid block header, consisting of its ID (uint32_t) followed
+by the writeTime of this block instance (unix-time, uint32_t).
+
+The log is written in a log-like manner (hence the name). This means writing starts at the beginning and continues until the end.
+Existing blocks are never written/updated, except for overwriting them when the write_ptr (next write position in the log) reaches the end and wraps around.
+In this case a simple "Garbage Collection" is performed to decide which blocks to overwrite.
+The simple rule is: Override a block iff it is not the most recent copy.
+This can be checked by reading the blockID from disk and looking it up in the bmap.
+If the most recent blockPtr from the bmap does not point to the currently examined block, the block can be overwritten safely.
+Otherwise the block is skipped and the next block is examined.
+
+This leads to some important fs limitations:
+  1. The fs does not work well if it is nearly full. The GC only runs On-Demand and may take a long time to find free space
+     for new blocks.
+  2. A precise number of "free" bytes in a log-based fs is very difficult to obtain, such a function is therefore not implemented.
+  3. As a direct result of 2, any fs operation that involves writing to disk may fail at any time without prior warning due to
+     missing free space. In this case a warning is written to cout and the operation returns an error code.
+     However, the fs remains in a consistent state. Note that there are no further guarantees!
+     This means the fs does not guarantee that the failed operations have been performed completely, partial or not at all.
+     (There is no guarenteed rollback to pre-failure state, although implementations might offer this.
+      The only guarantee is that such failures will never damage the file system, so users should query files and/or directorys
+      affected by the problematic operation to find out what was changed and what was not)
+
+(note: 2 is common for log-based filesystems)
+
+As a minimum (=after formatting), the log is required to contain at least one block: the INode of the root directory ("/").
+The BlockID of the root INode is always 1.
+
+The size of the log (in blocks) is (total_size_b - header_size_b - bmap_size_b) / 4096. (Rounded down)
+
+As previously stated, the log only contains blocks which are always exactly 4KiB.
+Below, the layout of these blocks is described:
+
+#########################################################
+###################     BLOCK      ######################
+#########################################################
+
+Everything in the log is a block, and all blocks share a common header.
+This block header is required for both bmap recovery and garbage collection.
+It consumes 8 bytes in each 4096 bytes block, so the general fs overhead for
+raw data storage is ~0.2%.
+
+0                               32
+----------------------------------
+|            block_id            | (unique block identifier, uint32_t)
+----------------------------------
+|         t_block_written        | (UNIX timestamp, when this block was written (not: "created"), uint32_t)
+----------------------------------
+.                                .
+.            (content)           . (block content, depends on subtype, 4088B)
+.                                .
+----------------------------------
+
+#########################################################
+###################     INODE      ######################
+#########################################################
+
+An INode is something a hardlink can point to. Most importantly files and directorys.
+Every file/dir has a primary INode which contains important meta information (like size).
+For small files and directorys, all data may be stored directly in this INode ("inlined").
+Larger files and directorys consist of additional blocks (*not*: INodes) that hold the data,
+and the primary INode points to them.
+
+All INodes have some common attributes, which are required to implement basic fs mechanisms like
+hardlinks.
+
+The following types of INodes exist:
+
+0 - invalid (not used, implementations should catch this)
+1 - directory
+2 - regular file
+3 - symlink
+
+Since every INode is also a Block, the first header fields are identical, refer to Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+|            t_created           | (UNIX timestamp, when this file/dir/something was created, uint32_t)
+----------------------------------
+|           filesize_b           | (size of contents in bytes (exact meaning depends on subtype), uint32_t)
+----------------------------------
+|type|i|reserved|  link_counter  | (type: type of INode (see list above), uint4_t)
+---------------------------------- (i: inline bit (1=inline, 0=non-inlined, single bit)
+.                                . (reserved: currently unused, ignored, 11 bits)
+.                                . (link_counter: number of hardlinks to this INode, uint16_t)
+.                                .
+.            (content)           . (content, depends on type and inline flag, 4076B)
+.                                .
+----------------------------------
+
+
+#########################################################
+###############     DIRECTORY_INODE     #################
+#########################################################
+
+INode of a directory. Type field is 1.
+
+Since every Directory_INode is an INode (and a Block), the first header fields are identical, refer to INode and Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+|            t_created           | (see INODE)
+----------------------------------
+|           filesize_b           | (see INODE)
+----------------------------------
+|type|i|reserved|  link_counter  | (type: type of INode, in this case: 1, uint4_t)
+---------------------------------- (see INODE)
+.                                . (see INODE)
+.                                . (see INODE)
+.                                .
+.            (content)           . (content, depends on inline flag, see below, 4076B)
+.                                .
+----------------------------------
+
+If the inline flag is 1, the content of the directory (a list of hardlinks) is located only in the content area.
+A Hardlink looks like this:
+
+0                               32
+----------------------------------
+|           target_id            | (blockID of the INode the hardlink points to. Target must always be valid (=existing), uint32_t)
+----------------------------------
+|                                |
+|                                |
+|                                |
+|           link name            | (name of this hardlink, cstring aka char[], 28 chars, including mandantory '\0')
+|                                |
+|                                |
+|                                |
+----------------------------------
+
+The hardlinks are aligned to the *end* of the block, so there is a gap of 12 unused bytes between the header above and the first hardlink.
+With this gap, the end of the last hardlink nicely aligns with the end of the block.
+
+The content region can contain at most 127 hardlinks. Hardlinks are not required to appear in any particular order.
+Also, gaps in the list are allowed. They are detected by their invalid target_id (zero) and are skipped.
+
+If the directory grows and exceeds 127 hardlinks, it must be switched to non-inlined mode (described below).
+However, implementations are free to switch to inlined mode at any time or not support writing of inlined INodes at all (note that reading of inlined blocks is *not* optional).
+Similarly, the decision when to switch back to inlined mode after the number of hardlinks shrinks to or below 127 is left to the implementation.
+(the reference implementation never switches back.)
+
+
+If the inline flag is 0 (zero), the content of the directory is located in seperate blocks, the DIRECTORY_ENTRY_LIST(s).
+The content area of the directory Inode then contains a list of blockIDs of these blocks:
+
+0                               32
+----------------------------------
+|            block_id            | (blockID of a DirectoryEntryList with contents of this dir, uint32_t)
+----------------------------------
+
+Like with Hardlinks, blockIDs are not required to appear in any special order, also gaps (id zero) are allowed.
+A DirectoryINode can link to 1019 DirEntryLists, which can hold 127 hardlinks each.
+This results in a maximum of 129413 children per directory (~2x ext4!).
+
+
+A Directory always must contain the hardlinks "." and "..", where "." points to itself and ".." points to the parent directory.
+The only exception is the root directory, where both links point to itself.
+
+
+
+#########################################################
+#############     DIRECTORY_ENTRY_LIST     ##############
+#########################################################
+
+A DirectoryEntryLists is a block (*not*: INode) that stores hardlinks.
+See DirectoryINode for more information how DirEntryLists are used.
+
+Since every DirectoryEntryList is also a Block, the first header fields are identical, refer to Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+|            (unused)            | (filler, to make list of hardlinks aligned to end of block, 24B)
+----------------------------------
+.                                .
+.            entrylist           . (list of hardlinks, see DIRECTORY_INODE)
+.                                .
+----------------------------------
+
+
+
+#########################################################
+##################     FILE_INODE     ###################
+#########################################################
+
+INode of a file. Type field is 2.
+
+Since every File_INode is an INode (and a Block), the first header fields are identical, refer to INode and Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+|            t_created           | (see INODE)
+----------------------------------
+|           filesize_b           | (see INODE)
+----------------------------------
+|type|i|reserved|  link_counter  | (type: type of INode, in this case: 2, uint4_t)
+---------------------------------- (see INODE)
+.                                . (see INODE)
+.                                . (see INODE)
+.                                .
+.            (content)           . (content, depends on inline flag, see below, 4076B)
+.                                .
+----------------------------------
+
+If the inline flag is 1, the content of the file is located only in the content area.
+The content begins at the first byte in the content section, the header field filesize_b denotes the size. Content after filesize_b is ignored. If the file grows and exceeds 4076B, the file must be switched to non-inlined mode (see below).
+
+As with directories, implementations are free to switch to and from non-inlined mode at any time (if the content fits).
+Also, it is valid for implementations to use the non-inlined mode exclusively, provided inlined files written by other implementations can still be read. (The reference implementation uses the inline mode, but never switches back from non-inline to inline if the file shrinks again after growing beyond 4076B.)
+
+
+If the inline flag is 0 (zero), the content of the file is located in seperate blocks (DataBlocks, see DATABLOCK).
+The content area of the file INode then contains a list of blockIDs of DataBlockLists (see DATABLOCKLIST), which in turn contain a list of blockIDs of DataBlocks.
+
+0                               32
+----------------------------------
+|            block_id            | (blockID of a DataBlockList with link to DataBlock, uint32_t)
+----------------------------------
+
+The content of the file is read from the first referenced DataBlock(List) to the last. Gaps in the list are not allowed, and the number of entries is determined by the filesize_b header field.
+
+The content region can contain at most 1019 blockIDs.
+Since every DataBlockList links to 1022 DataBlocks, which hold 4088B each, the maximum file size is 1019 * 1022 * 4088B = 4257316784B =~ 3.96 GiB.
+
+
+
+#########################################################
+################     DATABLOCKLIST     ##################
+#########################################################
+
+
+A DataBlockList is a block (*not*: INode) that stores blockIDs of DataBlocks..
+See FILE_INODE for more information how DataBlockLists are used.
+
+Since every DataBlockList is also a Block, the first header fields are identical, refer to Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+.                                .
+.            entrylist           . (list of blockIDs, see FILE_INODE, 4088B = 1022 blockIDs (uint32_t))
+.                                .
+----------------------------------
+
+
+#########################################################
+##################     DATABLOCK     ####################
+#########################################################
+
+
+A DataBlock is a block (*not*: INode) that stores raw file data.
+See DATABLOCKLIST and FILE_INODE for more information how DataBlocks are used.
+
+Since every DataBlock is also a Block, the first header fields are identical, refer to Block for details.
+
+0                               32
+----------------------------------
+|            block_id            | (see BLOCK)
+----------------------------------
+|         t_block_written        | (see BLOCK)
+----------------------------------
+.                                .
+.             content            . (4088B raw file content, (raw binary data))
+.                                .
+----------------------------------
