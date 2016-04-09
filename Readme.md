@@ -10,13 +10,13 @@ The primary target was to design and implement a flash-friendly file system that
 * Automatic block map reconstruction if snapshot is missing
 * Full POSIX-like support for files, directories and hardlinks
 * Reasonable size limits:
-** 16TiB max fs size
-** 4GiB max file size
-** 129413 hardlinks per directory (>2x ext4!)
+ * 16TiB max fs size
+ * 4GiB max file size
+ * 129413 hardlinks per directory (>2x ext4!)
 
 ## Scope & Linux support
 This repository contains everything I wrote and was able to trivially
-release as FOSS. The full system also featured an sd card driver,
+release as FOSS. The full system also featured an SD card driver,
 a block device server, a stream-like IPC mechanism and an L4Re compatible
 frontend server for the file system.
 
@@ -25,8 +25,9 @@ which allows for compiling and running sdi4fs on Linux without any modifications
 
 Since sdi4fs was designed to be accessed through a server on the mircokernel system,
 this repository only contains "libsdi4fs" - the file system itself without any frontend.
-To use sdi4fs on Linux, one needs to `#include sdi4fs.h` and use the API directly.
+To use sdi4fs on Linux, one needs to `#include FS.h` and use the API directly.
 In absence of the original SD card driver, sdi4fs can use a regular file as device.
+See [linux_main.cc](https://github.com/tfg13/sdi4fs/blob/master/linux_main.cc) as an example.
 
 ## License
-Apache 2.0, see LICENSE
+Apache 2.0, see [LICENSE](https://github.com/tfg13/sdi4fs/blob/master/LICENSE)
