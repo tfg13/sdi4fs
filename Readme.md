@@ -13,6 +13,8 @@ The primary target was to design and implement a flash-friendly file system that
  * 16TiB max fs size
  * 4GiB max file size
  * 129413 hardlinks per directory (>2x ext4!)
+ 
+See [sdi4fs_spec](https://github.com/tfg13/sdi4fs/blob/master/sdi4fs_spec) for details.
 
 ## Scope & Linux support
 This repository contains everything I wrote and was able to trivially
@@ -28,6 +30,10 @@ this repository only contains "libsdi4fs" - the file system itself without any f
 To use sdi4fs on Linux, one needs to `#include FS.h` and use the API directly.
 In absence of the original SD card driver, sdi4fs can use a regular file as device.
 See [linux_main.cc](https://github.com/tfg13/sdi4fs/blob/master/linux_main.cc) as an example.
+
+## Code & Compiling
+Written in C++, mostly conforms to the [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html).
+Running `make` should work on any half-modern Linux machine with support for C++11.
 
 ## License
 Apache 2.0, see [LICENSE](https://github.com/tfg13/sdi4fs/blob/master/LICENSE)
